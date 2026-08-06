@@ -30,8 +30,20 @@
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## Install Dependencies
+# MAGIC
+# MAGIC This notebook requires:
+# MAGIC - **pg8000**: Pure Python PostgreSQL driver (works on Serverless, no C extensions)
+# MAGIC   - **Why pg8000 instead of psycopg2?** psycopg2-binary has native C extensions that crash on Databricks Serverless compute (SIGABRT 134 kernel crashes). pg8000 is pure Python and works reliably on Serverless.
+# MAGIC - **sentence-transformers**: Embedding model library for generating vector representations
+# MAGIC - **trafilatura**: Article content extraction from HTML (strips ads/nav/boilerplate)
+# MAGIC - **requests**: HTTP client for fetching news from Massive API
+
+# COMMAND ----------
+
 # DBTITLE 1,Install all required packages
-# MAGIC %pip install -q psycopg2-binary sentence-transformers trafilatura requests
+# MAGIC %pip install -q pg8000 sentence-transformers trafilatura requests
 
 # COMMAND ----------
 
@@ -113,8 +125,9 @@ print(f"Using model {EMBEDDING_MODEL_NAME!r} -> {EMBEDDING_DIM}-dim vectors")
 # MAGIC Same secret, same decoding scheme as `lakebase.py`: a single base64-encoded
 # MAGIC Postgres URL (`postgresql://role:password@host:5432/db?sslmode=require`)
 # MAGIC stored in a Databricks secret scope. We parse it into the pieces both
-# MAGIC Spark's JDBC reader AND the raw JDBC connection helper below need
-# MAGIC (url/user/password).
+# MAGIC Spark's JDBC reader AND pg8000 connections need (host/port/database/user/password).
+# MAGIC
+# MAGIC **Database driver choice:** We use **pg8000** for all direct database writes (news articles, embeddings) instead of psycopg2 because pg8000 is pure Python with no C extensions, making it compatible with Databricks Serverless compute. psycopg2-binary has native C extensions that cause kernel crashes (SIGABRT 134) on Serverless.
 
 # COMMAND ----------
 
@@ -167,19 +180,41 @@ print(f"Database: {db_name}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Test JDBC Connection
-# Test JDBC connection with embedded credentials
+# DBTITLE 1,Test pg8000 Connection
+# Test pg8000 connection
+# NOTE: Using pg8000 instead of psycopg2 for Serverless compatibility
+# - psycopg2-binary has native C extensions that crash on Serverless (SIGABRT 134)
+# - pg8000 is pure Python with no C dependencies, works reliably on Serverless
+import pg8000.native
+
 try:
-    test_df = spark.read.jdbc(
-        url=jdbc_url,
-        table=WATCHLIST_TABLE_NAME,
-        properties=jdbc_properties
+    # Connect using pg8000 (pure Python, works on Serverless)
+    conn = pg8000.native.Connection(
+        host=db_host,
+        port=parsed.port or 5432,
+        database=db_name,
+        user=parsed.username,
+        password=parsed.password,
+        ssl_context=True  # Equivalent to sslmode=require
     )
-    count = test_df.count()
-    print(f"✅ Connection successful! Found {count} rows in {WATCHLIST_TABLE_NAME}")
-    test_df.show(5)
+    
+    # Test query to count rows in watchlist table
+    result = conn.run(f"SELECT COUNT(*) as count FROM {WATCHLIST_TABLE_NAME}")
+    count = result[0][0] if result else 0
+    
+    print(f"✅ pg8000 connection successful! Found {count} rows in {WATCHLIST_TABLE_NAME}")
+    
+    # Show sample rows
+    if count > 0:
+        rows = conn.run(f"SELECT * FROM {WATCHLIST_TABLE_NAME} LIMIT 5")
+        print(f"\nSample rows:")
+        for row in rows:
+            print(f"  {row}")
+    
+    conn.close()
+    
 except Exception as e:
-    print(f"❌ Connection failed: {e}")
+    print(f"❌ pg8000 connection failed: {e}")
 
 # COMMAND ----------
 
@@ -195,7 +230,8 @@ except Exception as e:
 # MAGIC 3. Run `sql/03_setup_chunk_embeddings_table.sql` to create `ticker_news_chunk_embeddings`
 # MAGIC    - Replace `{{EMBEDDING_DIM}}` with your model's dimension (e.g., 384)
 # MAGIC
-# MAGIC This notebook uses Spark JDBC for all database operations - no psycopg2 required.
+# MAGIC This notebook uses **pg8000** (pure Python PostgreSQL driver) for all writes,
+# MAGIC which works reliably on Databricks Serverless compute without C extensions.
 
 # COMMAND ----------
 
@@ -324,65 +360,64 @@ print(f"Run the next cell to insert them using executeLakebasePostgresSql tool."
 
 # COMMAND ----------
 
-# DBTITLE 1,Insert collected news articles using psycopg2
-import psycopg2
-from psycopg2.extras import execute_values
+# DBTITLE 1,Insert collected news articles using pg8000
+# NOTE: Using pg8000 instead of psycopg2 for Serverless compatibility
+# - psycopg2-binary has native C extensions that crash on Serverless (SIGABRT 134)
+# - pg8000 is pure Python with no C dependencies, works reliably on Serverless
+# - Both libraries provide the same PostgreSQL connectivity
+import pg8000.native
+
+# Check if required variables exist (kernel may have restarted)
+try:
+    _ = all_news_rows
+    _ = NEWS_TABLE_NAME
+    _ = db_host
+    _ = parsed
+    _ = db_name
+except NameError as e:
+    raise RuntimeError(
+        f"Required variable {e.name!r} not defined. " +
+        "The kernel may have been restarted. " +
+        "Please re-run cells 3, 5, and 9 before running this cell."
+    ) from e
 
 print(f"Inserting {len(all_news_rows)} news articles into {NEWS_TABLE_NAME}...")
 
-# Build connection from parsed URL
-conn = psycopg2.connect(
+# Connect using pg8000 (pure Python, works on Serverless)
+conn = pg8000.native.Connection(
     host=db_host,
     port=parsed.port or 5432,
-    dbname=db_name,
+    database=db_name,
     user=parsed.username,
     password=parsed.password,
-    sslmode='require'
+    ssl_context=True  # Equivalent to sslmode=require
 )
 
 try:
-    cursor = conn.cursor()
-    
-    # Prepare data tuples for batch insert
-    insert_data = [
-        (
-            row['id'],
-            row['ticker'],
-            row['title'],
-            row['description'],
-            row['author'],
-            row['article_url'],
-            row['publisher_name'],
-            row['keywords'],
-            row['sentiment'],
-            row['sentiment_reasoning'],
-            row['published_utc'],
-            row['payload']
-        )
-        for row in all_news_rows
-    ]
-    
-    # Batch insert with ON CONFLICT DO NOTHING for deduplication
+    # Prepare batch insert with ON CONFLICT DO NOTHING for deduplication
+    # Use RETURNING to count actual inserts (conflicts return empty)
     insert_sql = f"""
         INSERT INTO {NEWS_TABLE_NAME} (
             id, ticker, title, description, author, article_url, publisher_name,
             keywords, sentiment, sentiment_reasoning, published_utc, payload, synced_at
-        ) VALUES %s
+        ) VALUES (:id, :ticker, :title, :description, :author, :article_url, :publisher_name,
+                  :keywords, :sentiment, :sentiment_reasoning, :published_utc, :payload, CURRENT_TIMESTAMP)
         ON CONFLICT (id) DO NOTHING
+        RETURNING id
     """
     
-    # execute_values is much faster than individual INSERTs
-    # Add CURRENT_TIMESTAMP for synced_at column
-    template = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)"
-    execute_values(cursor, insert_sql, insert_data, template=template, page_size=100)
+    # pg8000 doesn't have execute_values, so we use executemany-style batching
+    inserted_count = 0
+    for row in all_news_rows:
+        result = conn.run(insert_sql, **row)
+        # RETURNING returns a list of tuples; if non-empty, row was inserted
+        if result:  
+            inserted_count += 1
     
-    conn.commit()
-    inserted_count = cursor.rowcount
     print(f"✅ Successfully inserted {inserted_count} new news articles")
     print(f"   (Duplicates were skipped via ON CONFLICT DO NOTHING)")
     
 finally:
-    cursor.close()
     conn.close()
 
 print(f"\nReady to compute embeddings! Run the cells below to continue.")
@@ -478,8 +513,7 @@ print(f"Computed {embeddings_df.count()} embeddings using {EMBEDDING_MODEL_NAME}
 # MAGIC ## Ensure the pgvector destination table exists
 # MAGIC
 # MAGIC `pgvector` isn't a JDBC-native type, but plain SQL text (`vector(N)`,
-# MAGIC `::vector` casts) works fine over a raw JDBC connection - no psycopg2
-# MAGIC needed.
+# MAGIC `::vector` casts) works fine over pg8000's native connection.
 
 # COMMAND ----------
 
@@ -495,14 +529,18 @@ print("\nRun sql/02_setup_embeddings_table.sql in your Lakebase database before 
 # MAGIC %md
 # MAGIC ## Upsert embeddings into Lakebase
 # MAGIC
-# MAGIC Written in batches via JDBC's `addBatch`/`executeBatch` for throughput.
+# MAGIC Writes directly to Postgres using **pg8000** (pure Python driver, no C extensions).
+# MAGIC We use pg8000 instead of psycopg2 because it works reliably on Databricks Serverless compute, whereas psycopg2-binary's C extensions cause kernel crashes.
+# MAGIC
 # MAGIC Each embedding is cast to Postgres' `vector` type via `::vector`.
 
 # COMMAND ----------
 
-# DBTITLE 1,Insert embeddings using psycopg2
-import psycopg2
-from psycopg2.extras import execute_values
+# DBTITLE 1,Insert embeddings using pg8000
+# NOTE: Using pg8000 instead of psycopg2 for Serverless compatibility
+# - psycopg2-binary has native C extensions that crash on Serverless (SIGABRT 134)
+# - pg8000 is pure Python with no C dependencies, works reliably on Serverless
+import pg8000.native
 from pyspark.sql.functions import current_timestamp, lit
 
 # Add model_name and embedded_at columns
@@ -510,61 +548,57 @@ embeddings_with_meta = embeddings_df.withColumn("model_name", lit(EMBEDDING_MODE
     "embedded_at", current_timestamp()
 )
 
-# Collect embeddings to driver for psycopg2 batch insert
+# Collect embeddings to driver
 embeddings_rows = embeddings_with_meta.collect()
 
 if len(embeddings_rows) > 0:
     print(f"Inserting {len(embeddings_rows)} embeddings into {EMBEDDINGS_TABLE_NAME}...")
     
-    # Build connection from parsed URL
-    conn = psycopg2.connect(
+    # Connect using pg8000 (pure Python, works on Serverless)
+    conn = pg8000.native.Connection(
         host=db_host,
         port=parsed.port or 5432,
-        dbname=db_name,
+        database=db_name,
         user=parsed.username,
         password=parsed.password,
-        sslmode='require'
+        ssl_context=True
     )
     
     try:
-        cursor = conn.cursor()
-        
-        # Prepare data tuples for batch insert
-        # Format embedding as PostgreSQL array literal: '{val1,val2,...}'
-        insert_data = [
-            (
-                row.id,
-                row.ticker,
-                row.title,
-                str(row.published_utc) if row.published_utc else None,
-                '{' + ','.join(str(float(x)) for x in row.embedding) + '}',
-                row.model_name,
-                row.embedded_at
-            )
-            for row in embeddings_rows
-        ]
-        
         # Batch insert with ON CONFLICT DO NOTHING for deduplication
+        # Format embedding as PostgreSQL array literal: '{val1,val2,...}'
+        # Use RETURNING to count actual inserts (conflicts return empty)
         insert_sql = f"""
             INSERT INTO {EMBEDDINGS_TABLE_NAME} (
                 id, ticker, title, published_utc, embedding, model_name, embedded_at
-            ) VALUES %s
+            ) VALUES (:id, :ticker, :title, :published_utc, :embedding::double precision[], :model_name, :embedded_at)
             ON CONFLICT (id) DO NOTHING
+            RETURNING id
         """
         
-        # execute_values is much faster than individual INSERTs
-        template = "(%s, %s, %s, %s, %s::double precision[], %s, %s)"
-        execute_values(cursor, insert_sql, insert_data, template=template, page_size=100)
+        inserted_count = 0
+        for row in embeddings_rows:
+            # Format embedding as PostgreSQL array literal
+            embedding_str = '{' + ','.join(str(float(x)) for x in row.embedding) + '}'
+            result = conn.run(
+                insert_sql,
+                id=row.id,
+                ticker=row.ticker,
+                title=row.title,
+                published_utc=str(row.published_utc) if row.published_utc else None,
+                embedding=embedding_str,
+                model_name=row.model_name,
+                embedded_at=row.embedded_at
+            )
+            if result:
+                inserted_count += 1
         
-        conn.commit()
-        inserted_count = cursor.rowcount
         print(f"✅ Successfully inserted {inserted_count} new embeddings")
         print(f"   (Duplicates were skipped via ON CONFLICT DO NOTHING)")
         print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
         print(f"  UPDATE {EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector WHERE embedding IS NOT NULL;")
         
     finally:
-        cursor.close()
         conn.close()
 else:
     print("No embeddings to write.")
@@ -716,12 +750,17 @@ print("\nRun sql/03_setup_chunk_embeddings_table.sql in your Lakebase database b
 
 # MAGIC %md
 # MAGIC ## Upsert chunk embeddings into Lakebase
+# MAGIC
+# MAGIC Writes directly to Postgres using **pg8000** (pure Python driver, no C extensions).
+# MAGIC We use pg8000 instead of psycopg2 because it works reliably on Databricks Serverless compute, whereas psycopg2-binary's C extensions cause kernel crashes.
 
 # COMMAND ----------
 
 # DBTITLE 1,Insert chunk embeddings using psycopg2
-import psycopg2
-from psycopg2.extras import execute_values
+# NOTE: Using pg8000 instead of psycopg2 for Serverless compatibility
+# - psycopg2-binary has native C extensions that crash on Serverless (SIGABRT 134)
+# - pg8000 is pure Python with no C dependencies, works reliably on Serverless
+import pg8000.native
 from pyspark.sql.functions import col, current_timestamp, expr, lit
 
 # Add id (article_id_chunk_index), model_name, and embedded_at columns
@@ -734,62 +773,58 @@ chunk_embeddings_with_meta = (
     .withColumn("chunk_index", col("chunk_index").cast("int"))
 )
 
-# Collect chunk embeddings to driver for psycopg2 batch insert
+# Collect chunk embeddings to driver
 chunk_embeddings_rows = chunk_embeddings_with_meta.collect()
 
 if len(chunk_embeddings_rows) > 0:
     print(f"Inserting {len(chunk_embeddings_rows)} chunk embeddings into {CHUNK_EMBEDDINGS_TABLE_NAME}...")
     
-    # Build connection from parsed URL
-    conn = psycopg2.connect(
+    # Connect using pg8000 (pure Python, works on Serverless)
+    conn = pg8000.native.Connection(
         host=db_host,
         port=parsed.port or 5432,
-        dbname=db_name,
+        database=db_name,
         user=parsed.username,
         password=parsed.password,
-        sslmode='require'
+        ssl_context=True
     )
     
     try:
-        cursor = conn.cursor()
-        
-        # Prepare data tuples for batch insert
-        # Format embedding as PostgreSQL array literal: '{val1,val2,...}'
-        insert_data = [
-            (
-                row.id,
-                row.article_id,
-                row.ticker,
-                int(row.chunk_index),
-                row.chunk_text,
-                '{' + ','.join(str(float(x)) for x in row.embedding) + '}',
-                row.model_name,
-                row.embedded_at
-            )
-            for row in chunk_embeddings_rows
-        ]
-        
         # Batch insert with ON CONFLICT DO NOTHING for deduplication
+        # Format embedding as PostgreSQL array literal: '{val1,val2,...}'
+        # Use RETURNING to count actual inserts (conflicts return empty)
         insert_sql = f"""
             INSERT INTO {CHUNK_EMBEDDINGS_TABLE_NAME} (
                 id, article_id, ticker, chunk_index, chunk_text, embedding, model_name, embedded_at
-            ) VALUES %s
+            ) VALUES (:id, :article_id, :ticker, :chunk_index, :chunk_text, :embedding::double precision[], :model_name, :embedded_at)
             ON CONFLICT (id) DO NOTHING
+            RETURNING id
         """
         
-        # execute_values is much faster than individual INSERTs
-        template = "(%s, %s, %s, %s, %s, %s::double precision[], %s, %s)"
-        execute_values(cursor, insert_sql, insert_data, template=template, page_size=100)
+        inserted_count = 0
+        for row in chunk_embeddings_rows:
+            # Format embedding as PostgreSQL array literal
+            embedding_str = '{' + ','.join(str(float(x)) for x in row.embedding) + '}'
+            result = conn.run(
+                insert_sql,
+                id=row.id,
+                article_id=row.article_id,
+                ticker=row.ticker,
+                chunk_index=int(row.chunk_index),
+                chunk_text=row.chunk_text,
+                embedding=embedding_str,
+                model_name=row.model_name,
+                embedded_at=row.embedded_at
+            )
+            if result:
+                inserted_count += 1
         
-        conn.commit()
-        inserted_count = cursor.rowcount
         print(f"✅ Successfully inserted {inserted_count} new chunk embeddings")
         print(f"   (Duplicates were skipped via ON CONFLICT DO NOTHING)")
         print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
         print(f"  UPDATE {CHUNK_EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector WHERE embedding IS NOT NULL;")
         
     finally:
-        cursor.close()
         conn.close()
 else:
     print("No chunk embeddings to write.")
