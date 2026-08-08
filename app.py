@@ -335,7 +335,7 @@ def search_news_by_text():
         limit = int(body.get("limit", 10))
         ticker_filter = body.get("ticker", "").strip().upper()
         
-        embeddings_table = f"{NEWS_TABLE_NAME}_chunk_embeddings"
+        embeddings_table = "ticker_news_chunk_embeddings"
         vector_str = "[" + ",".join(str(v) for v in query_vector) + "]"
         
         # Build query with optional ticker filter
