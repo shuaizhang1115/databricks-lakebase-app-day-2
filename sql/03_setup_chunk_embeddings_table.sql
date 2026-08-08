@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS ticker_news_chunk_embeddings (
     ticker TEXT NOT NULL,
     chunk_index INT NOT NULL,
     chunk_text TEXT NOT NULL,
-    embedding VECTOR({{EMBEDDING_DIM}}) NOT NULL,
+    embedding VECTOR(384) NOT NULL,
     model_name TEXT NOT NULL,
     embedded_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );

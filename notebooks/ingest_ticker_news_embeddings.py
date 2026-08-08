@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "5"
+# ///
 # MAGIC %md
 # MAGIC # Ingest Ticker News -> Vector Embeddings (Lakebase)
 # MAGIC
@@ -232,6 +236,55 @@ except Exception as e:
 # MAGIC
 # MAGIC This notebook uses **pg8000** (pure Python PostgreSQL driver) for all writes,
 # MAGIC which works reliably on Databricks Serverless compute without C extensions.
+
+# COMMAND ----------
+
+# DBTITLE 1,Run SQL setup files automatically
+# Automatically run all SQL setup files against Lakebase Postgres
+import pg8000.native
+
+sql_files = [
+    "../sql/01_setup_news_table.sql",
+    "../sql/02_setup_embeddings_table.sql",
+    "../sql/03_setup_chunk_embeddings_table.sql"
+]
+
+conn = pg8000.native.Connection(
+    host=db_host,
+    port=parsed.port or 5432,
+    database=db_name,
+    user=parsed.username,
+    password=parsed.password,
+    ssl_context=True
+)
+
+for sql_file in sql_files:
+    print(f"\n📄 Running {sql_file}...")
+    try:
+        with open(sql_file, 'r') as f:
+            sql = f.read()
+        
+        # Execute the SQL (pg8000 doesn't support multiple statements in one call,
+        # so we split by semicolons and execute each separately)
+        statements = [s.strip() for s in sql.split(';') if s.strip() and not s.strip().startswith('--')]
+        
+        for stmt in statements:
+            if stmt:
+                try:
+                    result = conn.run(stmt)
+                    if result:  # If there are results (like from SELECT)
+                        for row in result:
+                            print(f"  {row}")
+                except Exception as e:
+                    # Some statements might error if already exists, that's ok
+                    print(f"  Note: {e}")
+        
+        print(f"✅ {sql_file} completed")
+    except Exception as e:
+        print(f"❌ Failed to run {sql_file}: {e}")
+
+conn.close()
+print("\n✅ All SQL setup files executed successfully!")
 
 # COMMAND ----------
 

@@ -142,8 +142,8 @@
   </style>
 </head>
 <body>
-  <h1>Stock Watchlist</h1>
-  <p class="hint">Enter a single ticker symbol. This sends exactly ONE call to the Massive API to fetch the latest price, then adds it to your watchlist.</p>
+  <h1>Stock Watchlist & News Search</h1>
+  <p class="hint">Manage your watchlist and search for relevant stock news using AI-powered semantic search.</p>
 
   <div class="card">
     <form id="stock-form">
@@ -264,6 +264,70 @@
     });
 
     loadWatchlist();
+
+    // News search functionality
+    const searchForm = document.getElementById("search-form");
+    const searchResults = document.getElementById("search-results");
+
+    searchForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const query = document.getElementById("search-query").value.trim();
+      const ticker = document.getElementById("search-ticker").value.trim();
+      
+      if (!query) return;
+      
+      searchResults.innerHTML = '<p style="color: var(--muted);">Searching...</p>';
+      
+      try {
+        const body = { query, limit: 10 };
+        if (ticker) body.ticker = ticker;
+        
+        const resp = await fetch("/news/search-text", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        
+        const data = await resp.json();
+        
+        if (!resp.ok) {
+          searchResults.innerHTML = `<p style="color: var(--danger);">Error: ${data.error || resp.statusText}</p>`;
+          return;
+        }
+        
+        if (!data.results || data.results.length === 0) {
+          searchResults.innerHTML = '<p style="color: var(--muted);">No results found. Try a different query.</p>';
+          return;
+        }
+        
+        // Display results
+        let html = `<p style="font-weight: 600; margin-bottom: 12px;">Found ${data.count} results for "${data.query_text}":</p>`;
+        html += '<div style="display: flex; flex-direction: column; gap: 16px;">';
+        
+        data.results.forEach((result, idx) => {
+          const similarity = (result.similarity * 100).toFixed(1);
+          const chunkPreview = result.chunk_text.length > 200 
+            ? result.chunk_text.substring(0, 200) + '...' 
+            : result.chunk_text;
+          
+          html += `
+            <div style="padding: 12px; background: #f9fafb; border-radius: 8px; border-left: 3px solid var(--accent);">
+              <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 8px;">
+                <strong style="color: var(--accent);">[${result.ticker}]</strong>
+                <span style="font-size: 12px; color: var(--muted);">Similarity: ${similarity}%</span>
+              </div>
+              <p style="font-size: 13px; line-height: 1.5; color: var(--text); margin: 0;">${chunkPreview}</p>
+            </div>
+          `;
+        });
+        
+        html += '</div>';
+        searchResults.innerHTML = html;
+        
+      } catch (err) {
+        searchResults.innerHTML = `<p style="color: var(--danger);">Request failed: ${err}</p>`;
+      }
+    });
   </script>
 </body>
 </html>

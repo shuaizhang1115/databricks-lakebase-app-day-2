@@ -16,6 +16,7 @@ import re
 import requests
 from databricks.sdk import WorkspaceClient
 from flask import Flask, jsonify, render_template, request
+from sentence_transformers import SentenceTransformer
 
 import lakebase
 from massive_client import MassiveClient
@@ -25,6 +26,17 @@ logger = logging.getLogger("massive-app")
 
 app = Flask(__name__)
 _w = WorkspaceClient()
+
+# Lazy-loaded embedding model for text-to-vector conversion
+_embedding_model = None
+
+def get_embedding_model():
+    """Lazy-load the sentence-transformers model for text embeddings."""
+    global _embedding_model
+    if _embedding_model is None:
+        logger.info("Loading sentence-transformers model...")
+        _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    return _embedding_model
 
 TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
 WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
@@ -202,6 +214,176 @@ def sync_news_from_massive():
         total += _upsert_news_batch(ticker, articles)
 
     return jsonify({"synced": total, "tickers": tickers})
+
+
+@app.route("/news/search", methods=["POST"])
+def search_news_by_vector():
+    """
+    Perform vector similarity search on news embeddings.
+    
+    Body (JSON): {
+        "query_vector": [0.1, 0.2, ...],  # Required: embedding vector to search with
+        "limit": 10,                       # Optional: number of results (default 10)
+        "ticker": "AAPL"                   # Optional: filter by ticker
+    }
+    
+    Returns the top K most similar news articles based on cosine similarity.
+    The embeddings table (<NEWS_TABLE_NAME>_embeddings) must exist and have
+    a 'vector' column of type vector created by your Spark embedding notebook.
+    """
+    embeddings_table = f"{NEWS_TABLE_NAME}_embeddings"
+    
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+    
+    body = request.json
+    query_vector = body.get("query_vector")
+    
+    if not query_vector or not isinstance(query_vector, list):
+        return jsonify({"error": "query_vector is required and must be a list of numbers"}), 400
+    
+    limit = int(body.get("limit", 10))
+    ticker_filter = body.get("ticker", "").strip().upper()
+    
+    # Convert query vector to PostgreSQL vector format
+    vector_str = "[" + ",".join(str(v) for v in query_vector) + "]"
+    
+    # Build query with optional ticker filter
+    if ticker_filter and _TICKER_RE.match(ticker_filter):
+        query = f"""
+            SELECT 
+                e.id,
+                e.ticker,
+                n.title,
+                n.description,
+                n.article_url,
+                n.published_utc,
+                n.sentiment,
+                1 - (e.vector <=> %s::vector) as similarity
+            FROM {embeddings_table} e
+            JOIN {NEWS_TABLE_NAME} n ON e.id = n.id
+            WHERE e.ticker = %s
+            ORDER BY e.vector <=> %s::vector
+            LIMIT %s
+        """
+        params = (vector_str, ticker_filter, vector_str, limit)
+    else:
+        query = f"""
+            SELECT 
+                e.id,
+                e.ticker,
+                n.title,
+                n.description,
+                n.article_url,
+                n.published_utc,
+                n.sentiment,
+                1 - (e.vector <=> %s::vector) as similarity
+            FROM {embeddings_table} e
+            JOIN {NEWS_TABLE_NAME} n ON e.id = n.id
+            ORDER BY e.vector <=> %s::vector
+            LIMIT %s
+        """
+        params = (vector_str, vector_str, limit)
+    
+    try:
+        rows = lakebase.run_query(query, params)
+        return jsonify({
+            "results": rows,
+            "count": len(rows),
+            "query_params": {
+                "limit": limit,
+                "ticker": ticker_filter if ticker_filter else None
+            }
+        })
+    except Exception as e:
+        logger.exception("Error performing vector search")
+        return jsonify({
+            "error": str(e),
+            "hint": f"Ensure the {embeddings_table} table exists with a 'vector' column and pgvector extension is enabled"
+        }), 500
+
+
+@app.route("/news/search-text", methods=["POST"])
+def search_news_by_text():
+    """
+    Perform vector similarity search on news embeddings using a text query.
+    
+    Body (JSON): {
+        "query": "Apple iPhone sales growth",  # Required: text query to search for
+        "limit": 10,                            # Optional: number of results (default 10)
+        "ticker": "AAPL"                        # Optional: filter by ticker
+    }
+    
+    Converts the text query to an embedding vector and searches for similar articles.
+    """
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+    
+    body = request.json
+    query_text = body.get("query", "").strip()
+    
+    if not query_text:
+        return jsonify({"error": "query text is required"}), 400
+    
+    try:
+        # Convert text to embedding vector
+        model = get_embedding_model()
+        embedding = model.encode(query_text)
+        query_vector = embedding.tolist()
+        
+        # Call the existing vector search endpoint logic
+        limit = int(body.get("limit", 10))
+        ticker_filter = body.get("ticker", "").strip().upper()
+        
+        embeddings_table = f"{NEWS_TABLE_NAME}_chunk_embeddings"
+        vector_str = "[" + ",".join(str(v) for v in query_vector) + "]"
+        
+        # Build query with optional ticker filter
+        if ticker_filter and _TICKER_RE.match(ticker_filter):
+            query = f"""
+                SELECT 
+                    id,
+                    article_id,
+                    ticker,
+                    chunk_text,
+                    1 - (embedding <=> %s::vector) as similarity
+                FROM {embeddings_table}
+                WHERE ticker = %s AND 1 - (embedding <=> %s::vector) > 0.0
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """
+            params = (vector_str, ticker_filter, vector_str, vector_str, limit)
+        else:
+            query = f"""
+                SELECT 
+                    id,
+                    article_id,
+                    ticker,
+                    chunk_text,
+                    1 - (embedding <=> %s::vector) as similarity
+                FROM {embeddings_table}
+                WHERE 1 - (embedding <=> %s::vector) > 0.0
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """
+            params = (vector_str, vector_str, vector_str, limit)
+        
+        rows = lakebase.run_query(query, params)
+        return jsonify({
+            "results": rows,
+            "count": len(rows),
+            "query_text": query_text,
+            "query_params": {
+                "limit": limit,
+                "ticker": ticker_filter if ticker_filter else None
+            }
+        })
+    except Exception as e:
+        logger.exception("Error performing text-based vector search")
+        return jsonify({
+            "error": str(e),
+            "hint": f"Ensure the {embeddings_table} table exists with an 'embedding' column and the sentence-transformers model is available"
+        }), 500
 
 
 @app.route("/watchlist", methods=["GET"])
